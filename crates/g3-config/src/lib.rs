@@ -144,9 +144,9 @@ pub struct ComputerControlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WebDriverBrowser {
+    #[default]
     Safari,
     #[serde(rename = "chrome-headless")]
-    #[default]
     ChromeHeadless,
 }
 
@@ -156,6 +156,10 @@ pub struct WebDriverConfig {
     pub safari_port: u16,
     #[serde(default)]
     pub chrome_port: u16,
+    #[serde(default)]
+    /// Optional path to Chrome binary (e.g., Chrome for Testing)
+    /// If not set, ChromeDriver will use the default Chrome installation
+    pub chrome_binary: Option<String>,
     #[serde(default)]
     pub browser: WebDriverBrowser,
 }
@@ -177,7 +181,8 @@ impl Default for WebDriverConfig {
             enabled: true,
             safari_port: 4444,
             chrome_port: 9515,
-            browser: WebDriverBrowser::ChromeHeadless,
+            chrome_binary: None,
+            browser: WebDriverBrowser::Safari,
         }
     }
 }

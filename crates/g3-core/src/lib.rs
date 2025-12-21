@@ -244,13 +244,19 @@ impl StreamingToolParser {
             self.text_buffer.push_str(&chunk.content);
         }
 
-        // Handle native tool calls
+        // Handle native tool calls - return them immediately when received
+        // This allows tools to be executed as soon as they're fully parsed,
+        // preventing duplicate tool calls from being accumulated
         if let Some(ref tool_calls) = chunk.tool_calls {
             debug!("Received native tool calls: {:?}", tool_calls);
 
-            // Accumulate native tool calls
+            // Convert and return tool calls immediately
             for tool_call in tool_calls {
-                self.native_tool_calls.push(tool_call.clone());
+                let converted_tool = ToolCall {
+                    tool: tool_call.tool.clone(),
+                    args: tool_call.args.clone(),
+                };
+                completed_tools.push(converted_tool);
             }
         }
 
@@ -258,25 +264,6 @@ impl StreamingToolParser {
         if chunk.finished {
             self.message_stopped = true;
             debug!("Message finished, processing accumulated tool calls");
-        }
-
-        // If we have native tool calls and the message is stopped, return them
-        if self.message_stopped && !self.native_tool_calls.is_empty() {
-            debug!(
-                "Converting {} native tool calls",
-                self.native_tool_calls.len()
-            );
-
-            for native_tool in &self.native_tool_calls {
-                let converted_tool = ToolCall {
-                    tool: native_tool.tool.clone(),
-                    args: native_tool.args.clone(),
-                };
-                completed_tools.push(converted_tool);
-            }
-
-            // Clear native tool calls after processing
-            self.native_tool_calls.clear();
         }
 
         // Fallback: Try to parse JSON tool calls from text if no native tool calls
@@ -3658,6 +3645,11 @@ impl<W: UiWriter> Agent<W> {
         let mut iteration_count = 0;
         const MAX_ITERATIONS: usize = 400; // Prevent infinite loops
         let mut response_started = false;
+        let mut any_tool_executed = false; // Track if ANY tool was executed across all iterations
+        let mut auto_summary_attempts = 0; // Track auto-summary prompt attempts
+        const MAX_AUTO_SUMMARY_ATTEMPTS: usize = 2; // Limit auto-summary retries
+        let mut last_action_was_tool = false; // Track if the last action was a tool call (vs text response)
+        let mut any_text_response = false; // Track if LLM ever provided a text response
 
         // Check if we need to summarize before starting
         if self.context_window.should_summarize() {
@@ -4392,6 +4384,8 @@ impl<W: UiWriter> Agent<W> {
                             // 2. At the end when no tools were executed (handled in the "no tool executed" branch)
 
                             tool_executed = true;
+                            any_tool_executed = true; // Track across all iterations
+                            last_action_was_tool = true; // Last action was a tool call
 
                             // Reset the JSON tool call filter state after each tool execution
                             // This ensures the filter doesn't stay in suppression mode for subsequent streaming content
@@ -4439,6 +4433,8 @@ impl<W: UiWriter> Agent<W> {
                                     self.ui_writer.print_agent_response(&filtered_content);
                                     self.ui_writer.flush();
                                     current_response.push_str(&filtered_content);
+                                    last_action_was_tool = false; // Text response received
+                                    any_text_response = true;
                                 }
                             }
                         }
@@ -4695,10 +4691,48 @@ impl<W: UiWriter> Agent<W> {
                 let has_response = !current_response.is_empty() || !full_response.is_empty();
 
                 if !has_response {
-                    warn!(
-                        "Loop exited without any response after {} iterations",
-                        iteration_count
-                    );
+                    if any_tool_executed && last_action_was_tool && !any_text_response {
+                        // Only auto-prompt for summary if:
+                        // 1. Tools were executed in previous iterations
+                        // 2. The last action was a tool call (not a text response)
+                        // 3. No text response was ever provided by the LLM
+                        if auto_summary_attempts < MAX_AUTO_SUMMARY_ATTEMPTS {
+                            // Auto-prompt for a summary by adding a follow-up message
+                            auto_summary_attempts += 1;
+                            warn!(
+                                "LLM stopped without final response after executing tools ({} iterations, auto-summary attempt {})",
+                                iteration_count, auto_summary_attempts
+                            );
+                            self.ui_writer.print_context_status(
+                                "\n🔄 Model stopped without response. Auto-prompting for summary...\n"
+                            );
+                            
+                            // Add a follow-up message asking for summary
+                            let summary_prompt = Message::new(
+                                MessageRole::User,
+                                "Please provide a brief summary of what was accomplished and any next steps.".to_string(),
+                            );
+                            self.context_window.add_message(summary_prompt);
+                            request.messages = self.context_window.conversation_history.clone();
+                            
+                            // Continue the loop to get the summary
+                            continue;
+                        } else {
+                            // Max auto-summary attempts reached, give up gracefully
+                            warn!(
+                                "Max auto-summary attempts ({}) reached, returning without summary",
+                                MAX_AUTO_SUMMARY_ATTEMPTS
+                            );
+                            self.ui_writer.print_agent_response(
+                                "\n⚠️ The model stopped without providing a final response after multiple attempts.\n"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "Loop exited without any response after {} iterations",
+                            iteration_count
+                        );
+                    }
                 } else {
                     // Only set full_response if it's empty (first iteration without tools)
                     // This prevents duplication when the agent responds without calling final_output
@@ -5620,23 +5654,42 @@ impl<W: UiWriter> Agent<W> {
                             }
                         };
 
-                        // Wait for chromedriver to start up
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        // Wait for chromedriver to be ready with retry loop
+                        let max_retries = 10;
+                        let mut last_error = None;
+                        
+                        for attempt in 0..max_retries {
+                            // Wait before each attempt (200ms between retries, total max ~2s)
+                            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                            
+                            // Try to connect to ChromeDriver in headless mode (with optional custom binary)
+                            let driver_result = match &self.config.webdriver.chrome_binary {
+                                Some(binary) => g3_computer_control::ChromeDriver::with_port_headless_and_binary(port, Some(binary)).await,
+                                None => g3_computer_control::ChromeDriver::with_port_headless(port).await,
+                            };
+                            
+                            match driver_result {
+                                Ok(driver) => {
+                                    let session = std::sync::Arc::new(tokio::sync::Mutex::new(WebDriverSession::Chrome(driver)));
+                                    *self.webdriver_session.write().await = Some(session);
+                                    *self.webdriver_process.write().await = Some(webdriver_process);
 
-                        // Connect to ChromeDriver in headless mode
-                        match g3_computer_control::ChromeDriver::with_port_headless(port).await {
-                            Ok(driver) => {
-                                let session = std::sync::Arc::new(tokio::sync::Mutex::new(WebDriverSession::Chrome(driver)));
-                                *self.webdriver_session.write().await = Some(session);
-                                *self.webdriver_process.write().await = Some(webdriver_process);
-
-                                Ok("✅ WebDriver session started successfully! Chrome is running in headless mode (no visible window).".to_string())
-                            }
-                            Err(e) => {
-                                let _ = webdriver_process.kill().await;
-                                Ok(format!("❌ Failed to connect to ChromeDriver: {}\n\nThis might be because:\n  - Chrome is not installed\n  - ChromeDriver version doesn't match Chrome version\n  - Port {} is already in use\n\nMake sure Chrome and ChromeDriver are installed and compatible.", e, port))
+                                    return Ok("✅ WebDriver session started successfully! Chrome is running in headless mode (no visible window).".to_string());
+                                }
+                                Err(e) => {
+                                    last_error = Some(e);
+                                    if attempt < max_retries - 1 {
+                                        // Continue retrying
+                                        continue;
+                                    }
+                                }
                             }
                         }
+
+                        // All retries failed
+                        let _ = webdriver_process.kill().await;
+                        let error_msg = last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string());
+                        Ok(format!("❌ Failed to connect to ChromeDriver after {} attempts: {}\n\nThis might be because:\n  - Chrome is not installed\n  - ChromeDriver version doesn't match Chrome version\n  - Port {} is already in use\n\nMake sure Chrome and ChromeDriver are installed and compatible.", max_retries, error_msg, port))
                     }
                 }
             }
